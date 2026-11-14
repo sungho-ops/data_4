@@ -2,6 +2,8 @@ let loadedYear=null;
 const $=id=>document.getElementById(id);
 const fmt=x=>Number(x).toLocaleString('ko-KR',{maximumFractionDigits:3});
 let worker, nextId=0, requests=new Map(), sectors=[], rowChoices=[], cells=[], basket=[], result=null;
+let linkageData=[];
+const LINKAGE_THRESHOLD=1.0;
 function text(tag,value){const e=document.createElement(tag);e.textContent=value;return e;}
 function call(type,payload){return new Promise((resolve,reject)=>{const id=++nextId;requests.set(id,{resolve,reject});worker.postMessage({id,type,payload});});}
 function startWorker(){worker=new Worker('./worker.js');worker.onmessage=({data:d})=>{if(d.type==='status'){if($('status'))$('status').textContent=d.text;return;}const p=requests.get(d.id);if(!p)return;requests.delete(d.id);d.ok?p.resolve(d.result):p.reject(Error(d.error));};worker.onerror=e=>{for(const p of requests.values())p.reject(Error(e.message||'Worker 실행 오류'));requests.clear();};}
@@ -10,6 +12,7 @@ function invalidate(){result=null;if($('results'))$('results').hidden=true;}
 
 async function load(buffer){
  invalidate();basket=[];renderBasket();
+ resetLinkageDisplay('새 연도 자료를 불러왔습니다. 자료 준비 후 연쇄효과를 분석하세요.');
  for(const id of ['sheet','row','sector','add','run','row-search','col-search','sector-search','amount'])if($(id))$(id).disabled=true;
  if(worker)worker.terminate();for(const p of requests.values())p.reject(Error('데이터 다시 로드'));requests.clear();startWorker();
  try{const info=await call('init',buffer);sectors=info.sectors;options($('sector'),sectors);
@@ -87,40 +90,182 @@ if($('load-basic'))$('load-basic').onclick=async()=>{
   }
 };
 
-if(document.getElementById('btn-linkage')) document.getElementById('btn-linkage').addEventListener('click', async () => {
-  const btn = document.getElementById('btn-linkage');
-  const tbody = document.getElementById('linkage-results');
-  try {
-    btn.disabled = true;
-    btn.textContent = '계산 중...';
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">데이터를 분석 중입니다...</td></tr>'; 
-    const data = await call('analyze_linkage'); 
-    tbody.innerHTML = ''; 
-    data.forEach(item => {
-      const tr = document.createElement('tr');
-      const backward = Number(item.backward);
-      const forward = Number(item.forward);
-      let note = '';
-      if (backward >= 1.0 && forward >= 1.0) {
-        note = '⭐ 핵심산업'; 
-        tr.style.backgroundColor = '#e6f4ea';
-        tr.style.fontWeight = 'bold';
-      }
-      tr.innerHTML = `
-        <td>${item.code}</td>
-        <td>${item.name}</td>
-        <td>${backward.toFixed(3)}</td>
-        <td>${forward.toFixed(3)}</td>
-        <td style="color: #0b5345;">${note}</td>
-      `;
-      tbody.appendChild(tr);
-    });
-  } catch (error) {
-    console.error('연쇄효과 분석 중 오류:', error);
-    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:red;">분석 실패: ${error.message}</td></tr>`;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '핵심 산업 분석하기';
+// 전방·후방 연쇄효과 필터 UI를 기존 페이지에 동적으로 추가합니다.
+// index.html을 수정하지 않아도 app.js 교체만으로 적용할 수 있습니다.
+function ensureLinkageFilterUI(){
+  const button=$('btn-linkage');
+  if(!button || $('linkage-filter')) return;
+
+  const wrap=document.createElement('div');
+  wrap.id='linkage-filter-wrap';
+  wrap.style.display='flex';
+  wrap.style.flexDirection='column';
+  wrap.style.alignItems='flex-start';
+  wrap.style.gap='6px';
+  wrap.style.margin='16px 0 4px';
+
+  const label=text('label','산업 유형 선택');
+  label.htmlFor='linkage-filter';
+  label.style.display='flex';
+  label.style.flexDirection='column';
+  label.style.gap='6px';
+  label.style.minWidth='min(100%, 320px)';
+
+  const select=document.createElement('select');
+  select.id='linkage-filter';
+  select.disabled=true;
+  select.style.width='min(100%, 360px)';
+  select.setAttribute('aria-label','연쇄효과 산업 유형 필터');
+  [
+    ['all','전체 산업'],
+    ['core','핵심 산업'],
+    ['backward','후방연쇄 선도 산업'],
+    ['forward','전방연쇄 선도 산업']
+  ].forEach(([value,labelText])=>{
+    const option=text('option',labelText);
+    option.value=value;
+    select.append(option);
+  });
+  label.append(select);
+
+  const summary=text('p','자료를 불러온 뒤 핵심 산업 분석을 실행하세요.');
+  summary.id='linkage-summary';
+  summary.className='note';
+  summary.setAttribute('role','status');
+  summary.style.margin='0';
+
+  wrap.append(label,summary);
+  button.insertAdjacentElement('afterend',wrap);
+  select.addEventListener('change',renderLinkageResults);
+}
+
+function setLinkageMessage(message){
+  const tbody=$('linkage-results');
+  if(!tbody)return;
+  const tr=document.createElement('tr');
+  const td=text('td',message);
+  td.colSpan=5;
+  td.className='empty-state';
+  tr.append(td);
+  tbody.replaceChildren(tr);
+}
+
+function resetLinkageDisplay(message='자료를 불러온 뒤 핵심 산업 분석을 실행하세요.'){
+  linkageData=[];
+  const filter=$('linkage-filter');
+  if(filter){filter.value='all';filter.disabled=true;}
+  if($('linkage-summary'))$('linkage-summary').textContent=message;
+  setLinkageMessage(message);
+}
+
+function updateLinkageFilterOptions(){
+  const filter=$('linkage-filter');
+  if(!filter)return;
+  const count=linkageData.length;
+  const core=linkageData.filter(x=>Number(x.backward)>=LINKAGE_THRESHOLD && Number(x.forward)>=LINKAGE_THRESHOLD).length;
+  const backward=linkageData.filter(x=>Number(x.backward)>=LINKAGE_THRESHOLD).length;
+  const forward=linkageData.filter(x=>Number(x.forward)>=LINKAGE_THRESHOLD).length;
+  const options=[
+    ['all',`전체 산업 (${count.toLocaleString('ko-KR')}개)`],
+    ['core',`핵심 산업 (${core.toLocaleString('ko-KR')}개)`],
+    ['backward',`후방연쇄 선도 산업 (${backward.toLocaleString('ko-KR')}개)`],
+    ['forward',`전방연쇄 선도 산업 (${forward.toLocaleString('ko-KR')}개)`]
+  ];
+  filter.replaceChildren(...options.map(([value,labelText])=>{
+    const option=text('option',labelText);
+    option.value=value;
+    return option;
+  }));
+  filter.value='all';
+  filter.disabled=false;
+}
+
+function renderLinkageResults(){
+  const tbody=$('linkage-results');
+  const filter=$('linkage-filter');
+  if(!tbody || !linkageData.length)return;
+
+  const selected=filter?filter.value:'all';
+  const visible=linkageData.filter(item=>{
+    const backward=Number(item.backward);
+    const forward=Number(item.forward);
+    if(selected==='core')return backward>=LINKAGE_THRESHOLD && forward>=LINKAGE_THRESHOLD;
+    if(selected==='backward')return backward>=LINKAGE_THRESHOLD;
+    if(selected==='forward')return forward>=LINKAGE_THRESHOLD;
+    return true;
+  });
+
+  // 후방 필터는 영향력 계수, 전방 필터는 감응도 계수 순으로 정렬합니다.
+  const sortKey=selected==='forward'?'forward':'backward';
+  visible.sort((a,b)=>Number(b[sortKey])-Number(a[sortKey]));
+
+  const summary=$('linkage-summary');
+  const categoryLabel={
+    all:'전체 산업',core:'핵심 산업',
+    backward:'후방연쇄 선도 산업',forward:'전방연쇄 선도 산업'
+  }[selected]||'전체 산업';
+  if(summary){
+    const year=loadedYear?loadedYear+'년 ':' ';
+    const criteria={
+      all:'전체 산업',
+      core:'영향력·감응도 계수 모두 1.000 이상',
+      backward:'영향력 계수 1.000 이상 · 핵심 산업 포함',
+      forward:'감응도 계수 1.000 이상 · 핵심 산업 포함'
+    }[selected]||'전체 산업';
+    summary.textContent=`${year}${categoryLabel}: ${visible.length.toLocaleString('ko-KR')}개 표시 · ${criteria}`;
+  }
+
+  if(!visible.length){
+    setLinkageMessage('선택한 조건에 해당하는 산업이 없습니다.');
+    return;
+  }
+
+  tbody.replaceChildren(...visible.map(item=>{
+    const tr=document.createElement('tr');
+    const backward=Number(item.backward);
+    const forward=Number(item.forward);
+    const isCore=backward>=LINKAGE_THRESHOLD && forward>=LINKAGE_THRESHOLD;
+    let note='—';
+    if(isCore){
+      note='⭐ 핵심 산업';
+      tr.style.backgroundColor='#e6f4ea';
+      tr.style.fontWeight='bold';
+    }else if(backward>=LINKAGE_THRESHOLD){
+      note='후방연쇄 선도';
+    }else if(forward>=LINKAGE_THRESHOLD){
+      note='전방연쇄 선도';
+    }
+    [item.code,item.name,backward.toFixed(3),forward.toFixed(3),note].forEach(value=>tr.append(text('td',value)));
+    return tr;
+  }));
+}
+
+ensureLinkageFilterUI();
+
+if($('btn-linkage'))$('btn-linkage').addEventListener('click',async()=>{
+  const btn=$('btn-linkage');
+  const filter=$('linkage-filter');
+  try{
+    btn.disabled=true;
+    btn.textContent='계산 중...';
+    if(filter)filter.disabled=true;
+    if($('linkage-summary'))$('linkage-summary').textContent='산업별 영향력·감응도 계수를 계산하고 있습니다.';
+    setLinkageMessage('데이터를 분석 중입니다...');
+
+    const data=await call('analyze_linkage');
+    if(!Array.isArray(data))throw Error('연쇄효과 결과 형식이 올바르지 않습니다.');
+    linkageData=data;
+    updateLinkageFilterOptions();
+    renderLinkageResults();
+  }catch(error){
+    console.error('연쇄효과 분석 중 오류:',error);
+    if(filter)filter.disabled=true;
+    if($('linkage-summary'))$('linkage-summary').textContent='연쇄효과 분석에 실패했습니다.';
+    setLinkageMessage('분석 실패: '+error.message);
+  }finally{
+    btn.disabled=false;
+    btn.textContent='핵심 산업 분석하기';
+    if(filter && linkageData.length)filter.disabled=false;
   }
 });
 // 초기화 버튼 이벤트 (새로고침 없이 상태 리셋)
@@ -140,12 +285,15 @@ if(document.getElementById('reset-app')) {
     if($('explore-caption')) $('explore-caption').textContent = '기본 자료를 불러온 후 표시됩니다.';
     if($('status')) $('status').textContent = '초기화되었습니다. 새로운 연도를 선택하고 불러오기를 눌러주세요.';
     
-    // 3. 시뮬레이션 장바구니 및 결과창 초기화
+    // 3. 연쇄효과 결과와 필터 초기화
+    resetLinkageDisplay();
+
+    // 4. 시뮬레이션 장바구니 및 결과창 초기화
     invalidate();
     basket = [];
     renderBasket();
     
-    // 4. 하단 입력 필드 및 버튼들 비활성화 (초기 상태로 되돌림)
+    // 5. 하단 입력 필드 및 버튼들 비활성화 (초기 상태로 되돌림)
     for(const id of ['sheet','row','sector','add','run','row-search','col-search','sector-search','amount']){
       if($(id)) $(id).disabled = true;
     }
